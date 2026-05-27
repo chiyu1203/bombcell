@@ -896,18 +896,45 @@ def get_all_quality_metrics(
         runtimes_spikes_missing_2[unit_idx] = time.time() - time_tmp
 
         time_tmp = time.time()
-        fraction_RPVs, num_violations = qm.fraction_RP_violations(
-            these_spike_times,
-            these_amplitudes,
-            use_these_times,
-            param)
-        runtimes_RPV_2[unit_idx] = time.time() - time_tmp
-        fraction_RPVs = fraction_RPVs[0] # only 'use_these_times', so single time chunk
+        # Check if using new sliding RPV mode
+        use_new_rpv_mode = "rpv_method" in param
 
-        quality_metrics["fractionRPVs_estimatedTauR"][unit_idx] = fraction_RPVs[
-            int(quality_metrics["RPV_window_index"][unit_idx])
-        ]
-        RPV_tauR_estimate_units_NtauR.append([unit_idx, fraction_RPVs])
+        if use_new_rpv_mode:
+            # New mode: use sliding_rp_violations directly for cleaner output
+            contamination, estimated_tauR, n_violations = qm.sliding_rp_violations(
+                these_spike_times,
+                use_these_times,
+                param,
+                return_per_bin=False
+            )
+            quality_metrics["fractionRPVs_estimatedTauR"][unit_idx] = contamination
+            quality_metrics["estimatedTauR"][unit_idx] = estimated_tauR
+            RPV_tauR_estimate_units_NtauR.append([unit_idx, np.array([contamination])])
+        else:
+            # Legacy mode: use original fraction_RP_violations
+            fraction_RPVs, num_violations = qm.fraction_RP_violations(
+                these_spike_times,
+                these_amplitudes,
+                use_these_times,
+                param)
+            fraction_RPVs = fraction_RPVs[0]  # only 'use_these_times', so single time chunk
+
+            quality_metrics["fractionRPVs_estimatedTauR"][unit_idx] = fraction_RPVs[
+                int(quality_metrics["RPV_window_index"][unit_idx])
+            ]
+            # Compute estimated tauR from legacy parameters
+            tauR_min = param.get("tauR_valuesMin", 0.002)
+            tauR_max = param.get("tauR_valuesMax", 0.002)
+            tauR_step = param.get("tauR_valuesStep", 0.0005)
+            tauR_window = np.arange(tauR_min, tauR_max + tauR_step, tauR_step)
+            rpv_idx = int(quality_metrics["RPV_window_index"][unit_idx])
+            if rpv_idx < len(tauR_window):
+                quality_metrics["estimatedTauR"][unit_idx] = tauR_window[rpv_idx]
+            else:
+                quality_metrics["estimatedTauR"][unit_idx] = tauR_window[0]
+            RPV_tauR_estimate_units_NtauR.append([unit_idx, fraction_RPVs])
+
+        runtimes_RPV_2[unit_idx] = time.time() - time_tmp
 
         # get presence ratio
         time_tmp = time.time()
@@ -1179,11 +1206,55 @@ def run_bombcell(ks_dir, save_path, param, save_figures=False, return_figures=Fa
             signal_to_noise_ratio = None
             raw_waveforms_id_match = None
     else:
-        raw_waveforms_full = None
-        raw_waveforms_peak_channel = None
-        signal_to_noise_ratio = None
-        raw_waveforms_id_match = None
-        param["extractRaw"] = False  # No waveforms to extract!
+        # No raw data file available - try to load existing waveforms from disk
+        raw_waveforms_file = Path(save_path) / "templates._bc_rawWaveforms.npy"
+        raw_waveforms_peak_channel_file = Path(save_path) / "templates._bc_rawWaveformPeakChannels.npy"
+        raw_waveforms_id_match_file = Path(save_path) / "_bc_rawWaveforms_kilosort_format.npy"
+        snr_noise_file = Path(save_path) / "templates._bc_baselineNoiseAmplitude.npy"
+        snr_noise_idx_file = Path(save_path) / "templates._bc_baselineNoiseAmplitudeIndex.npy"
+
+        if raw_waveforms_file.exists() and raw_waveforms_peak_channel_file.exists():
+            if param.get("verbose", False):
+                print("\n📂 Loading existing raw waveforms (no raw data file available)...")
+            raw_waveforms_full = np.load(raw_waveforms_file)
+            raw_waveforms_peak_channel = np.load(raw_waveforms_peak_channel_file)
+            raw_waveforms_id_match = np.load(raw_waveforms_id_match_file) if raw_waveforms_id_match_file.exists() else None
+
+            # Compute SNR from loaded waveforms if baseline noise exists
+            if snr_noise_file.exists() and snr_noise_idx_file.exists():
+                baseline_noise_all = np.load(snr_noise_file)
+                baseline_noise_idx = np.load(snr_noise_idx_file)
+                unique_clusters = np.unique(spike_clusters)
+                n_clusters = len(unique_clusters)
+                signal_to_noise_ratio = np.zeros(n_clusters)
+                for i, cid in enumerate(unique_clusters):
+                    mask = unique_clusters == cid
+                    cluster_idx = np.where(mask)[0]
+                    peak_channel = raw_waveforms_peak_channel[cluster_idx].astype(int)
+
+                    # Maximum absolute value of the waveform (signal)
+                    peak_waveform = raw_waveforms_full[cluster_idx, peak_channel, :]
+                    signal = np.max(np.abs(np.squeeze(peak_waveform)))
+
+                    # Get baseline noise for this cluster
+                    baseline_mask = baseline_noise_idx == cid
+                    baseline = baseline_noise_all[baseline_mask]
+
+                    # Calculate MAD (noise) - Median Absolute Deviation
+                    noise = np.median(np.abs(baseline - np.median(baseline)))
+
+                    # Calculate SNR
+                    signal_to_noise_ratio[i] = signal / noise
+            else:
+                signal_to_noise_ratio = None
+
+            param["extractRaw"] = False  # Waveforms loaded, not extracted
+        else:
+            raw_waveforms_full = None
+            raw_waveforms_peak_channel = None
+            signal_to_noise_ratio = None
+            raw_waveforms_id_match = None
+            param["extractRaw"] = False  # No waveforms to extract!
 
     # Remove duplicate spikes
     if param["removeDuplicateSpikes"]:
